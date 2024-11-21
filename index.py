@@ -1,96 +1,81 @@
 import cv2
 import numpy as np
 from flask import Flask, render_template, Response, request
-from sklearn.cluster import KMeans
 
 app = Flask(__name__)
 
-# Initialize variables
-reference_image = None
-orb = cv2.ORB_create(nfeatures=1500)
+# Global variables for ORB detector, feature matcher, and clicked object
+orb = cv2.ORB_create(nfeatures=1000)
 bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-tracking_box = None
-tracker = cv2.TrackerCSRT_create()  # Robust tracker
+clicked_image = None  # The image of the clicked object
+keypoints1, descriptors1 = None, None  # Features of the clicked object
 
-# Parameters
-matching_threshold = 40  # Minimum matches
-tracking_enabled = False
 
-def extract_features(image):
-    """Extract ORB features."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    keypoints, descriptors = orb.detectAndCompute(gray, None)
-    return keypoints, descriptors
+def match_and_track(frame):
+    """Match the clicked object features and draw a single accurate box."""
+    global clicked_image, keypoints1, descriptors1
 
-@app.route('/')
-def home():
-    return render_template('index.html')
+    if clicked_image is None or descriptors1 is None:
+        return frame  # No object clicked yet
 
-@app.route('/upload', methods=['POST'])
-def upload():
-    """Upload reference image."""
-    global reference_image, ref_keypoints, ref_descriptors
+    # Detect and compute ORB features in the current frame
+    keypoints2, descriptors2 = orb.detectAndCompute(frame, None)
 
-    file = request.files['image']
-    if file:
-        img = np.frombuffer(file.read(), np.uint8)
-        reference_image = cv2.imdecode(img, cv2.IMREAD_COLOR)
-
-        # Extract features from the uploaded image
-        ref_keypoints, ref_descriptors = extract_features(reference_image)
-        return "Image uploaded and processed successfully!"
-    return "Failed to upload image!", 400
-    
-app=app
-
-def detect_object(frame):
-    """Detect object in the frame."""
-    global reference_image, ref_keypoints, ref_descriptors, tracking_box, tracker, tracking_enabled
-
-    if reference_image is None:
-        return frame
-
-    # Convert frame to grayscale and extract features
-    frame_keypoints, frame_descriptors = extract_features(frame)
-
-    if ref_descriptors is not None and frame_descriptors is not None:
-        # Match features
-        matches = bf.match(ref_descriptors, frame_descriptors)
+    if descriptors2 is not None:
+        # Match features using BFMatcher
+        matches = bf.match(descriptors1, descriptors2)
         matches = sorted(matches, key=lambda x: x.distance)
 
-        # Filter matches using K-Means clustering
-        if len(matches) >= matching_threshold:
-            src_pts = np.float32([ref_keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-            dst_pts = np.float32([frame_keypoints[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        # Filter matches based on distance threshold
+        good_matches = [m for m in matches if m.distance < 50]
 
-            # Compute homography
-            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            if M is not None:
-                h, w = reference_image.shape[:2]
-                pts = np.float32([[0, 0], [0, h], [w, h], [w, 0]]).reshape(-1, 1, 2)
-                dst = cv2.perspectiveTransform(pts, M)
+        # Proceed only if sufficient good matches are found
+        if len(good_matches) > 10:  # Minimum good matches for detection
+            matched_points = np.array([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
 
-                # Initialize tracker for detected object
-                tracking_box = cv2.boundingRect(dst)
-                tracker.init(frame, tracking_box)
-                tracking_enabled = True
+            # Cluster matched points using K-Means
+            _, labels, centers = cv2.kmeans(
+                matched_points.astype(np.float32),
+                K=1,
+                bestLabels=None,
+                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2),
+                attempts=10,
+                flags=cv2.KMEANS_RANDOM_CENTERS,
+            )
+            x, y = centers[0]
+            w, h = 150, 150  # Fixed bounding box size
+            bbox = (int(x - w / 2), int(y - h / 2), w, h)
 
-    # If tracking is enabled, update the tracker
-    if tracking_enabled:
-        success, tracking_box = tracker.update(frame)
-        if success:
-            x, y, w, h = map(int, tracking_box)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
+            # Draw a single bounding box around the detected object
+            x, y, w, h = [int(v) for v in bbox]
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (168, 30, 10), 2)
+            cv2.putText(frame, "Same Product found", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (125, 0, 125), 2)
 
     return frame
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/')
+def index():
+    """Render the main page."""
+    return render_template('index.html')
+
+
+@app.route('/click', methods=['POST'])
+def click_image():
+    """Handle the image clicked by the user."""
+    global clicked_image, keypoints1, descriptors1
+    if 'image' in request.files:
+        file = request.files['image']
+        np_img = np.frombuffer(file.read(), np.uint8)
+        clicked_image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+        keypoints1, descriptors1 = orb.detectAndCompute(clicked_image, None)
+        return "Image uploaded successfully"
+    return "No image uploaded"
+
 
 def generate_frames():
-    """Capture video frames and process."""
-    global tracking_box, tracking_enabled
+    """Generate video frames for real-time detection."""
+    global clicked_image
 
     cap = cv2.VideoCapture(0)
     while True:
@@ -98,15 +83,20 @@ def generate_frames():
         if not success:
             break
 
-        frame = cv2.resize(frame, (640, 480))
-        frame = detect_object(frame)
+        # Match and track objects in the frame
+        frame = match_and_track(frame)
 
+        # Encode the frame to JPEG format
         _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-    cap.release()
+
+@app.route('/video_feed')
+def video_feed():
+    """Provide video feed."""
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True,host='0.0.0.0',port=5000)
