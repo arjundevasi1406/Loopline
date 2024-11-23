@@ -41,7 +41,7 @@ def match_and_track(frame):
                 criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2),
                 attempts=10,
                 flags=cv2.KMEANS_RANDOM_CENTERS,
-            )
+           )
             x, y = centers[0]
             w, h = 150, 150  # Fixed bounding box size
             bbox = (int(x - w / 2), int(y - h / 2), w, h)
